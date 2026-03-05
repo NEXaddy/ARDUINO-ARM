@@ -4,15 +4,12 @@
 #include <Adafruit_ICM20X.h>
 #include <Adafruit_Sensor.h>
 
-//#include <Basicmicro.h>
-//Basicmicro roboclaw(&Serial1, 10000);
-
 #define TCAADDR 0x70
-
 #define ROBOCLAW_ADDR 0x80
 
 #include "RoboClaw.h"
-HardwareSerial RoboSerial(1);   // UART1
+
+HardwareSerial RoboSerial(1);
 RoboClaw roboclaw(&RoboSerial, 10000);
 
 const int LINACTSWITCH = D2;
@@ -29,172 +26,302 @@ Adafruit_ICM20948 icm;
 
 unsigned long last_time = 0;
 unsigned long delta_time;
+
 bool safetyTriggered;
 bool valid;
 uint8_t status;
-    
+
+
+// ============================
+// TCA9548A I2C multiplexer
+// ============================
 void tcaselect(uint8_t i) {
   if (i > 7) return;
+
   Wire.beginTransmission(TCAADDR);
   Wire.write(1 << i);
   Wire.endTransmission();
 }
 
+
+// ============================
+// Motor stop helper
+// ============================
+void stopMotor() {
+  roboclaw.ForwardM1(ROBOCLAW_ADDR, 0);
+  roboclaw.BackwardM1(ROBOCLAW_ADDR, 0);
+}
+
+
+// ============================
+// Distance function
+// ============================
+int getDistance(uint8_t port) {
+
+  VL53L0X_RangingMeasurementData_t measure;
+
+  tcaselect(port);
+
+  lox.rangingTest(&measure, false);
+
+  if (measure.RangeStatus != 4) {
+    return measure.RangeMilliMeter;
+  }
+
+  return -1;
+}
+
+
+// ============================
+// SETUP
+// ============================
 void setup() {
-  Serial.begin(38400);   // USB debug
+
+  Serial.begin(38400);
+
   pinMode(LINACTSWITCH, INPUT_PULLUP);
   pinMode(BACKSWITCH, INPUT_PULLUP);
 
-   RoboSerial.begin(
+  RoboSerial.begin(
     38400,
     SERIAL_8N1,
-    D8,   // RX  (optional)
-    D9    // TX  (required)
+    D8,
+    D9
   );
-  
+
   roboclaw.begin(38400);
+
   Wire.begin();
 
   if (!icm.begin_I2C()) {
     Serial.println("ICM20948 not found");
     while (1);
   }
+
   Serial.println("ICM20948 OK");
 
-  // Initialize sensors on each port
+
+  // Initialize sensors
   for (uint8_t i = 0; i < 8; i++) {
+
     tcaselect(i);
+
     if (!lox.begin()) {
       Serial.print("Sensor not found on port ");
       Serial.println(i);
-    } else {
+    }
+
+    else {
       Serial.print("Sensor OK on port ");
       Serial.println(i);
     }
   }
+
+
   roboclaw.SetM1MaxCurrent(ROBOCLAW_ADDR, 7000);
+
   roboclaw.SetM1PositionPID(
     ROBOCLAW_ADDR,
-      1,   // kp
-      0.5,   // ki
-      0.25,  // kd
-      2000,  // kiMax
-      2,     // deadzone
-      0,     // min
-      127    // max
-   );
-  roboclaw.SetM1VelocityPID(ROBOCLAW_ADDR,1,0.5,0.25,44000);
+    1,
+    0.5,
+    0.25,
+    2000,
+    2,
+    0,
+    127
+  );
+
+  roboclaw.SetM1VelocityPID(
+    ROBOCLAW_ADDR,
+    1,
+    0.5,
+    0.25,
+    44000
+  );
+
+
+  // ============================
+  // Homing until BACK switch
+  // ============================
 
   safetyTriggered = digitalRead(BACKSWITCH) == LOW;
+
   while (!safetyTriggered) {
+
     roboclaw.BackwardM1(ROBOCLAW_ADDR, 10);
+
     safetyTriggered = digitalRead(BACKSWITCH) == LOW;
   }
-  roboclaw.BackwardM1(ROBOCLAW_ADDR, 0);
+
+  stopMotor();
+
   Serial.println("Setup complete");
+
   roboclaw.ResetEncoders(ROBOCLAW_ADDR);
+
   int32_t enc = roboclaw.ReadEncM1(ROBOCLAW_ADDR, &status, &valid);
-  roboclaw.SpeedAccelDistanceM1(ROBOCLAW_ADDR,100,100, 10, 1);
+
+  roboclaw.SpeedAccelDistanceM1(
+    ROBOCLAW_ADDR,
+    100,
+    100,
+    10,
+    1
+  );
 }
 
 
+
+// ============================
+// LOOP
+// ============================
 void loop() {
-  VL53L0X_RangingMeasurementData_t measure;
-  safetyTriggered = (digitalRead(LINACTSWITCH) == LOW || digitalRead(BACKSWITCH) == LOW);
-  while (!safetyTriggered) {
-    safetyTriggered = (digitalRead(LINACTSWITCH) == LOW || digitalRead(BACKSWITCH) == LOW);
-    for (uint8_t i = 0; i < 8; i++) {
-      if (i == 3 || i == 4 || i == 5) continue;
-      tcaselect(i);
 
-      lox.rangingTest(&measure, false);
+  bool linLimit = digitalRead(LINACTSWITCH) == LOW;
+  bool backLimit = digitalRead(BACKSWITCH) == LOW;
 
-      Serial.print("Port ");
-      Serial.print(i);
-      Serial.print(": ");
+  // ============================
+  // SAFETY STOP
+  // ============================
 
-      if (measure.RangeStatus != 4) {
-        
-        int distance = 9;
+  if (linLimit || backLimit) {
 
-        
-        Serial.print("Distance to Tree: ");
-        Serial.println(distance);
+    stopMotor();
 
-        if(distance > TARGET_DISTANCE){
-          Serial.print("Extending Arm");
-          roboclaw.ForwardM1(ROBOCLAW_ADDR, 40);
-        } 
-        else if (distance < TARGET_DISTANCE){
-          Serial.print("Retracting Arm");
-          roboclaw.BackwardM1(ROBOCLAW_ADDR, 40);
-        }
-        else if (distance == TARGET_DISTANCE) {
-          Serial.print("Distance Calibrated");
-          roboclaw.ForwardM1(ROBOCLAW_ADDR, 0);
-        }
-    }
+    Serial.println("LIMIT SWITCH TRIGGERED - MOTOR STOPPED");
 
-    sensors_event_t accel, gyro, mag, temp;
-    icm.getEvent(&accel, &gyro, &temp, &mag);
-    Serial.println("");
-    Serial.print("Temperature ");
-    Serial.print(temp.temperature);
-    Serial.println(" deg C");
+    delay(100);
 
-    /* Display the results (acceleration is measured in m/s^2) */
-    Serial.print("Accel X: ");
-    Serial.print(accel.acceleration.x);
-    Serial.print("\tY: ");
-    Serial.print(accel.acceleration.y);
-    Serial.print(" \tZ: ");
-    Serial.print(accel.acceleration.z);
-    Serial.println(" m/s^2 ");
-
-    Serial.print("Mag X: ");
-    Serial.print(mag.magnetic.x);
-    Serial.print(" \tY: ");
-    Serial.print(mag.magnetic.y);
-    Serial.print(" \tZ: ");
-    Serial.print(mag.magnetic.z);
-    Serial.println(" uT");
-
-    /* Display the results (acceleration is measured in m/s^2) */
-    Serial.print("Gyro X: ");
-    Serial.print(gyro.gyro.x);
-    Serial.print(" \tY: ");
-    Serial.println(gyro.gyro.y);
-    Serial.println("");
-
-//     roboclaw.BackwardM1(ROBOCLAW_ADDR, 5000);
-  // delay(2000);
-//   roboclaw.ForwardM1(ROBOCLAW_ADDR, 500);
-
-    int32_t enc = roboclaw.ReadEncM1(ROBOCLAW_ADDR, &status, &valid);
-    if (valid) {
-      Serial.print("encoder 1 parts moved: ");
-      Serial.println(enc);
-      Serial.print("Encoder status: \n");
-      Serial.println(status);
-    }
-    else {
-      Serial.println("Encoder reading failed\n");
-    }
-
-    int32_t encoders_to_adv = (int32_t) lround((PPR / MM_PER_REV) * 15);  
-    Serial.print("encoder to adv: ");
-    Serial.println(encoders_to_adv);
-    
- //   roboclaw.SpeedAccelDistanceM1(ROBOCLAW_ADDR,100,100, 10, 1);
-
-    unsigned long now = millis();
-    delta_time = now - last_time;
-    last_time = now;
-    Serial.print("Timer: ");
-    Serial.print(delta_time);
-    Serial.println(" ms");
-    Serial.println("----\n");
+    return;
   }
-    }
-}  
-  
+
+
+  // ============================
+  // Read distance from sensor
+  // ============================
+
+  int distance = getDistance(0);
+
+  if (distance < 0) {
+
+    Serial.println("Distance read failed");
+
+    delay(50);
+
+    return;
+  }
+
+  Serial.print("Distance: ");
+  Serial.println(distance);
+
+
+  int error = distance - TARGET_DISTANCE;
+
+
+  // ============================
+  // Motor Control
+  // ============================
+
+  if (abs(error) <= DIST_TOLERANCE) {
+
+    Serial.println("Distance calibrated");
+
+    stopMotor();
+  }
+
+  else if (error > 0) {
+
+    Serial.println("Extending Arm");
+
+    roboclaw.ForwardM1(ROBOCLAW_ADDR, 40);
+  }
+
+  else {
+
+    Serial.println("Retracting Arm");
+
+    roboclaw.BackwardM1(ROBOCLAW_ADDR, 40);
+  }
+
+
+
+  // ============================
+  // IMU Read
+  // ============================
+
+  sensors_event_t accel, gyro, mag, temp;
+
+  icm.getEvent(&accel, &gyro, &temp, &mag);
+
+  Serial.println("");
+
+  Serial.print("Temperature ");
+  Serial.print(temp.temperature);
+  Serial.println(" deg C");
+
+  Serial.print("Accel X: ");
+  Serial.print(accel.acceleration.x);
+  Serial.print("\tY: ");
+  Serial.print(accel.acceleration.y);
+  Serial.print("\tZ: ");
+  Serial.print(accel.acceleration.z);
+  Serial.println(" m/s^2");
+
+  Serial.print("Mag X: ");
+  Serial.print(mag.magnetic.x);
+  Serial.print("\tY: ");
+  Serial.print(mag.magnetic.y);
+  Serial.print("\tZ: ");
+  Serial.print(mag.magnetic.z);
+  Serial.println(" uT");
+
+  Serial.print("Gyro X: ");
+  Serial.print(gyro.gyro.x);
+  Serial.print("\tY: ");
+  Serial.println(gyro.gyro.y);
+
+
+
+  // ============================
+  // Encoder
+  // ============================
+
+  int32_t enc = roboclaw.ReadEncM1(ROBOCLAW_ADDR, &status, &valid);
+
+  if (valid) {
+
+    Serial.print("encoder 1 parts moved: ");
+    Serial.println(enc);
+
+    Serial.print("Encoder status: ");
+    Serial.println(status);
+  }
+
+  else {
+
+    Serial.println("Encoder reading failed");
+  }
+
+
+  int32_t encoders_to_adv = (int32_t) lround((PPR / MM_PER_REV) * 15);
+
+  Serial.print("encoder to adv: ");
+  Serial.println(encoders_to_adv);
+
+
+
+  unsigned long now = millis();
+
+  delta_time = now - last_time;
+
+  last_time = now;
+
+  Serial.print("Timer: ");
+  Serial.print(delta_time);
+  Serial.println(" ms");
+
+  Serial.println("----\n");
+
+
+  delay(50);
+}
