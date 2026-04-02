@@ -1,0 +1,204 @@
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+#include <Adafruit_ICM20948.h>
+#include <Adafruit_ICM20X.h>
+#include <Adafruit_Sensor.h>
+
+#define TCAADDR 0x70
+#define ROBOCLAW_ADDR 0x80
+
+#include "RoboClaw.h"
+
+HardwareSerial RoboSerial(1);   
+RoboClaw roboclaw(&RoboSerial, 10000);
+
+const int LINACTSWITCH = D2;
+const int BACKSWITCH = D3;
+
+const long PPR = 103.8;
+const int MM_PER_REV = 8;
+
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+Adafruit_ICM20948 icm;
+
+unsigned long last_time = 0;
+unsigned long delta_time;
+
+bool safetyTriggered;
+bool valid;
+uint8_t status;
+
+// --- PID CONTROL FLAGS ---
+bool moveStarted = false;
+int32_t targetPosition = 0;
+
+
+// ---------------- TCA MULTIPLEXER ----------------
+void tcaselect(uint8_t i) {
+  if (i > 7) return;
+  Wire.beginTransmission(TCAADDR);
+  Wire.write(1 << i);
+  Wire.endTransmission();
+}
+
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(38400);
+
+  pinMode(LINACTSWITCH, INPUT_PULLUP);
+  pinMode(BACKSWITCH, INPUT_PULLUP);
+
+  RoboSerial.begin(38400, SERIAL_8N1, D8, D9);
+  roboclaw.begin(38400);
+
+  Wire.begin();
+
+  // --- IMU INIT ---
+  if (!icm.begin_I2C()) {
+    Serial.println("ICM20948 not found");
+    while (1);
+  }
+  Serial.println("ICM20948 OK");
+
+  // --- TOF SENSORS INIT ---
+  for (uint8_t i = 0; i < 8; i++) {
+    tcaselect(i);
+    if (!lox.begin()) {
+      Serial.print("Sensor not found on port ");
+      Serial.println(i);
+    } else {
+      Serial.print("Sensor OK on port ");
+      Serial.println(i);
+    }
+  }
+
+  // --- ROBOCLAW PID SETUP ---
+  roboclaw.SetM1MaxCurrent(ROBOCLAW_ADDR, 7000);
+
+  roboclaw.SetM1PositionPID(
+    ROBOCLAW_ADDR,
+    500,   // kp (FIXED: was too small)
+    0,
+    50,
+    2000,
+    2,
+    0,
+    127
+  );
+
+  roboclaw.SetM1VelocityPID(
+    ROBOCLAW_ADDR,
+    2,
+    0.5,
+    0.1,
+    44000
+  );
+
+  // --- HOME TO BACK SWITCH ---
+  safetyTriggered = digitalRead(BACKSWITCH) == LOW;
+
+  while (!safetyTriggered) {
+    roboclaw.BackwardM1(ROBOCLAW_ADDR, 25);
+    safetyTriggered = digitalRead(BACKSWITCH) == LOW;
+  }
+
+  roboclaw.BackwardM1(ROBOCLAW_ADDR, 0);
+  Serial.println("Homing complete");
+
+  // --- RESET ENCODER ---
+  roboclaw.ResetEncoders(ROBOCLAW_ADDR);
+
+  // --- CALCULATE TARGET ---
+  targetPosition = (int32_t) lround((PPR / MM_PER_REV) * 15);
+
+  // --- SEND MOVE COMMAND ONCE ---
+  roboclaw.SpeedAccelDistanceM1(
+    ROBOCLAW_ADDR,
+    100,
+    100,
+    targetPosition,
+    1
+  );
+
+  moveStarted = true;
+
+  Serial.println("Setup complete");
+}
+
+
+// ---------------- LOOP ----------------
+void loop() {
+
+  // --- SAFETY ---
+  safetyTriggered = (digitalRead(LINACTSWITCH) == LOW || digitalRead(BACKSWITCH) == LOW);
+
+  if (safetyTriggered) {
+    roboclaw.ForwardM1(ROBOCLAW_ADDR, 0);
+    Serial.println("SAFETY TRIGGERED");
+    return;
+  }
+
+  VL53L0X_RangingMeasurementData_t measure;
+
+  // --- TOF SENSORS ---
+  for (uint8_t i = 0; i < 8; i++) {
+    if (i == 3 || i == 4 || i == 5) continue;
+
+    tcaselect(i);
+    lox.rangingTest(&measure, false);
+
+    Serial.print("Port ");
+    Serial.print(i);
+    Serial.print(": ");
+
+    if (measure.RangeStatus != 4) {
+      Serial.print(measure.RangeMilliMeter);
+      Serial.println(" mm");
+    } else {
+      Serial.println("Out of range");
+    }
+  }
+
+  // --- IMU ---
+  sensors_event_t accel, gyro, mag, temp;
+  icm.getEvent(&accel, &gyro, &temp, &mag);
+
+  Serial.print("Temp: ");
+  Serial.println(temp.temperature);
+
+  Serial.print("Accel X: ");
+  Serial.println(accel.acceleration.x);
+
+  Serial.print("Gyro X: ");
+  Serial.println(gyro.gyro.x);
+
+  // --- ENCODER ---
+  int32_t enc = roboclaw.ReadEncM1(ROBOCLAW_ADDR, &status, &valid);
+
+  if (valid) {
+    Serial.print("Encoder: ");
+    Serial.println(enc);
+
+    // --- TARGET CHECK ---
+    if (moveStarted && abs(enc - targetPosition) < 5) {
+      Serial.println("Reached target!");
+      moveStarted = false;
+    }
+  } else {
+    Serial.println("Encoder read failed");
+  }
+
+  // --- TIMING ---
+  unsigned long now = millis();
+  delta_time = now - last_time;
+  last_time = now;
+
+  Serial.print("Loop time: ");
+  Serial.print(delta_time);
+  Serial.println(" ms");
+
+  Serial.println("----");
+
+  delay(50);  // CRITICAL: prevents command flooding
+}=
