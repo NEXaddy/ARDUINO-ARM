@@ -1,4 +1,4 @@
-#include "RoboClaw.h"
+//#include "RoboClaw.h"
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
 #include <Adafruit_ICM20948.h>
@@ -16,10 +16,10 @@ Basicmicro roboclaw(&Serial1, 10000);
 
 
 HardwareSerial RoboSerial(1);   // UART1
-RoboClaw roboclaw(&RoboSerial, 10000);
+//RoboClaw roboclaw(&RoboSerial, 10000);
 
 const int LINACTSWITCH = D2;
-const int BACKSWITCH = D3;F
+const int BACKSWITCH = D3;
 
 const long PPR = 103.8;
 const int MM_PER_REV = 8;
@@ -72,7 +72,7 @@ void setup() {
      Serial.println(i);
    }
  }
- roboclaw.SetM1MaxCurrent(ADDRESS, 7000);
+ roboclaw.SetM1MaxCurrent(ADDRESS, 7000,1000);
 
   safetyTriggered = digitalRead(BACKSWITCH) == LOW;
   while (!safetyTriggered) {
