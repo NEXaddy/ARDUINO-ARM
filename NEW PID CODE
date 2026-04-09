@@ -1,3 +1,4 @@
+#include <Basicmicro.h>
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
 #include <Adafruit_ICM20948.h>
@@ -7,33 +8,44 @@
 #define TCAADDR 0x70
 #define ROBOCLAW_ADDR 0x80
 
-#include "RoboClaw.h"
-
-HardwareSerial RoboSerial(1);   
-RoboClaw roboclaw(&RoboSerial, 10000);
+HardwareSerial RoboSerial(1);
+Basicmicro roboclaw(&RoboSerial, 10000);
 
 const int LINACTSWITCH = D2;
 const int BACKSWITCH = D3;
 
-const long PPR = 103.8;
+const float PPR = 103.8;
 const int MM_PER_REV = 8;
 
-Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+#define NUM_SENSORS 8
+Adafruit_VL53L0X lox[NUM_SENSORS];
 Adafruit_ICM20948 icm;
 
-unsigned long last_time = 0;
-unsigned long delta_time;
 
-bool safetyTriggered;
-bool valid;
+enum State {
+  HOMING,
+  IDLE,
+  MOVING,
+  FAULT
+};
+
+State currentState = HOMING;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastDebug = 0;
+const unsigned long SENSOR_INTERVAL = 100;   // ms
+const unsigned long DEBUG_INTERVAL = 500;    // ms
+
+uint16_t distances[NUM_SENSORS];
 uint8_t status;
+bool valid;
 
-// --- PID CONTROL FLAGS ---
-bool moveStarted = false;
 int32_t targetPosition = 0;
+bool moveCommandSent = false;
 
+const int CURRENT_LIMIT = 6000;  // mA
+bool faultTriggered = false;
 
-// ---------------- TCA MULTIPLEXER ----------------
 void tcaselect(uint8_t i) {
   if (i > 7) return;
   Wire.beginTransmission(TCAADDR);
@@ -41,164 +53,142 @@ void tcaselect(uint8_t i) {
   Wire.endTransmission();
 }
 
+void stopMotor() {
+  roboclaw.DutyM1(ROBOCLAW_ADDR, 0);
+}
 
-// ---------------- SETUP ----------------
-void setup() {
-  Serial.begin(38400);
-
-  pinMode(LINACTSWITCH, INPUT_PULLUP);
-  pinMode(BACKSWITCH, INPUT_PULLUP);
-
-  RoboSerial.begin(38400, SERIAL_8N1, D8, D9);
-  roboclaw.begin(38400);
-
-  Wire.begin();
-
-  // --- IMU INIT ---
-  if (!icm.begin_I2C()) {
-    Serial.println("ICM20948 not found");
-    while (1);
+bool checkSafety() {
+  if (digitalRead(LINACTSWITCH) == LOW || digitalRead(BACKSWITCH) == LOW) {
+    Serial.println("LIMIT SWITCH TRIGGERED");
+    return true;
   }
-  Serial.println("ICM20948 OK");
 
-  // --- TOF SENSORS INIT ---
-  for (uint8_t i = 0; i < 8; i++) {
-    tcaselect(i);
-    if (!lox.begin()) {
-      Serial.print("Sensor not found on port ");
-      Serial.println(i);
-    } else {
-      Serial.print("Sensor OK on port ");
-      Serial.println(i);
+  int16_t c1, c2;
+  if (roboclaw.ReadCurrents(ROBOCLAW_ADDR, c1, c2)) {
+    if (c1 > CURRENT_LIMIT) {
+      Serial.println("OVERCURRENT!");
+      return true;
     }
   }
 
-  // --- ROBOCLAW PID SETUP ---
-  roboclaw.SetM1MaxCurrent(ROBOCLAW_ADDR, 7000);
-
-  roboclaw.SetM1PositionPID(
-    ROBOCLAW_ADDR,
-    500,   // kp (FIXED: was too small)
-    0,
-    50,
-    2000,
-    2,
-    0,
-    127
-  );
-
-  roboclaw.SetM1VelocityPID(
-    ROBOCLAW_ADDR,
-    2,
-    0.5,
-    0.1,
-    44000
-  );
-
-  // --- HOME TO BACK SWITCH ---
-  safetyTriggered = digitalRead(BACKSWITCH) == LOW;
-
-  while (!safetyTriggered) {
-    roboclaw.BackwardM1(ROBOCLAW_ADDR, 25);
-    safetyTriggered = digitalRead(BACKSWITCH) == LOW;
-  }
-
-  roboclaw.BackwardM1(ROBOCLAW_ADDR, 0);
-  Serial.println("Homing complete");
-
-  // --- RESET ENCODER ---
-  roboclaw.ResetEncoders(ROBOCLAW_ADDR);
-
-  // --- CALCULATE TARGET ---
-  targetPosition = (int32_t) lround((PPR / MM_PER_REV) * 15);
-
-  // --- SEND MOVE COMMAND ONCE ---
-  roboclaw.SpeedAccelDistanceM1(
-    ROBOCLAW_ADDR,
-    100,
-    100,
-    targetPosition,
-    1
-  );
-
-  moveStarted = true;
-
-  Serial.println("Setup complete");
+  return false;
 }
 
-
-// ---------------- LOOP ----------------
-void loop() {
-
-  // --- SAFETY ---
-  safetyTriggered = (digitalRead(LINACTSWITCH) == LOW || digitalRead(BACKSWITCH) == LOW);
-
-  if (safetyTriggered) {
-    roboclaw.ForwardM1(ROBOCLAW_ADDR, 0);
-    Serial.println("SAFETY TRIGGERED");
-    return;
-  }
-
+void readSensors() {
   VL53L0X_RangingMeasurementData_t measure;
 
-  // --- TOF SENSORS ---
-  for (uint8_t i = 0; i < 8; i++) {
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
     if (i == 3 || i == 4 || i == 5) continue;
 
     tcaselect(i);
-    lox.rangingTest(&measure, false);
-
-    Serial.print("Port ");
-    Serial.print(i);
-    Serial.print(": ");
+    lox[i].rangingTest(&measure, false);
 
     if (measure.RangeStatus != 4) {
-      Serial.print(measure.RangeMilliMeter);
-      Serial.println(" mm");
+      distances[i] = measure.RangeMilliMeter;
     } else {
-      Serial.println("Out of range");
+      distances[i] = 9999;
     }
   }
+}
 
-  // --- IMU ---
-  sensors_event_t accel, gyro, mag, temp;
-  icm.getEvent(&accel, &gyro, &temp, &mag);
+void setup() {
+  pinMode(LINACTSWITCH, INPUT_PULLUP);
+  pinMode(BACKSWITCH, INPUT_PULLUP);
 
-  Serial.print("Temp: ");
-  Serial.println(temp.temperature);
+  Serial.begin(38400);
+  RoboSerial.begin(38400);
+  roboclaw.begin(38400);
+  Wire.begin();
 
-  Serial.print("Accel X: ");
-  Serial.println(accel.acceleration.x);
-
-  Serial.print("Gyro X: ");
-  Serial.println(gyro.gyro.x);
-
-  // --- ENCODER ---
-  int32_t enc = roboclaw.ReadEncM1(ROBOCLAW_ADDR, &status, &valid);
-
-  if (valid) {
-    Serial.print("Encoder: ");
-    Serial.println(enc);
-
-    // --- TARGET CHECK ---
-    if (moveStarted && abs(enc - targetPosition) < 5) {
-      Serial.println("Reached target!");
-      moveStarted = false;
-    }
-  } else {
-    Serial.println("Encoder read failed");
+  if (!icm.begin_I2C()) {
+    Serial.println("IMU FAIL");
+    while (1);
   }
 
-  // --- TIMING ---
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    tcaselect(i);
+    lox[i].begin();
+  }
+
+  roboclaw.SetM1MaxCurrent(ROBOCLAW_ADDR, 7000, 3000);
+  roboclaw.SetM1VelocityPID(ROBOCLAW_ADDR, 1.0, 0.5, 0.25, 12000);
+
+  roboclaw.ResetEncoders(ROBOCLAW_ADDR);
+}
+
+void loop() {
+
+  if (checkSafety()) {
+    stopMotor();
+    currentState = FAULT;
+  }
+
   unsigned long now = millis();
-  delta_time = now - last_time;
-  last_time = now;
 
-  Serial.print("Loop time: ");
-  Serial.print(delta_time);
-  Serial.println(" ms");
+  if (now - lastSensorRead > SENSOR_INTERVAL) {
+    readSensors();
+    lastSensorRead = now;
+  }
+  
+  switch (currentState) {
 
-  Serial.println("----");
+    case HOMING:
+      if (digitalRead(BACKSWITCH) == HIGH) {
+        roboclaw.DutyM1(ROBOCLAW_ADDR, -2000);
+      } else {
+        stopMotor();
+        roboclaw.ResetEncoders(ROBOCLAW_ADDR);
+        currentState = IDLE;
+        Serial.println("HOMING COMPLETE");
+      }
+      break;
 
-  delay(50);  // CRITICAL: prevents command flooding
-}=
+    case IDLE:
+      if (distances[0] > 200) {   // example condition
+        targetPosition = (int32_t)((PPR / MM_PER_REV) * 15);
+        moveCommandSent = false;
+        currentState = MOVING;
+      }
+      break;
+
+    case MOVING:
+      if (!moveCommandSent) {
+        roboclaw.SpeedAccelDeccelPositionM1(
+          ROBOCLAW_ADDR,
+          2000,
+          1500,
+          2000,
+          targetPosition,
+          1
+        );
+        moveCommandSent = true;
+      }
+
+      {
+        uint32_t enc = roboclaw.ReadEncM1(ROBOCLAW_ADDR, &status, &valid);
+        if (valid && abs((int32_t)enc - targetPosition) < 10) {
+          Serial.println("TARGET REACHED");
+          currentState = IDLE;
+        }
+      }
+      break;
+
+    case FAULT:
+      stopMotor();
+      // stays here until reset
+      break;
+  }
+
+  if (now - lastDebug > DEBUG_INTERVAL) {
+    Serial.print("State: ");
+    Serial.println(currentState);
+
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      Serial.print(distances[i]);
+      Serial.print(" ");
+    }
+    Serial.println();
+
+    lastDebug = now;
+  }
+}
