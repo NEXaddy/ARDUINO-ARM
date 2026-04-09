@@ -153,14 +153,7 @@ void loop() {
 
     case MOVING:
       if (!moveCommandSent) {
-        roboclaw.SpeedAccelDeccelPositionM1(
-          ROBOCLAW_ADDR,
-          2000,
-          1500,
-          2000,
-          targetPosition,
-          1
-        );
+        roboclaw.SpeedAccelDeccelPositionM1(ROBOCLAW_ADDR,2000,1500,2000,targetPosition,1);
         moveCommandSent = true;
       }
 
@@ -175,7 +168,7 @@ void loop() {
 
     case FAULT:
       stopMotor();
-      // stays here until reset
+      
       break;
   }
 
